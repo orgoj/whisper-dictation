@@ -2,6 +2,8 @@
 
 High-accuracy Czech dictation using OpenAI Whisper `large-v3-turbo` model accelerated by NVIDIA GPU.
 
+**Forked from:** [ideasman42/nerd-dictation](https://github.com/ideasman42/nerd-dictation) - modified for GPU-accelerated Czech transcription using faster-whisper.
+
 ## Requirements
 
 ### System packages

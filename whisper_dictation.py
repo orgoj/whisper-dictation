@@ -11,6 +11,9 @@ import time
 import numpy as np
 from faster_whisper import WhisperModel
 
+# Pause debounce time (seconds) - prevent rapid toggles
+PAUSE_DEBOUNCE = 0.3
+
 # FILTERED PHRASES - text in this list will not be typed
 FILTERED_PHRASES = [
     "Děkujeme za pozornost.",
@@ -114,12 +117,12 @@ def type_text(text, args):
 def run_dictation(args):
     quick_startup_check()
 
-    # State management using local variables
-    class State:
-        paused = False
-        exit_requested = False
-
-    state = State()
+    # Thread-safe state management
+    pause_requested = threading.Event()  # Signal-safe flag for pause toggle
+    state_lock = threading.Lock()
+    paused = False
+    exit_requested = False
+    last_toggle_time = 0
 
     # Signal-safe write function
     def safe_write(msg):
@@ -130,7 +133,8 @@ def run_dictation(args):
             pass
 
     def update_status_file():
-        status = "PAUSED" if state.paused else "LIVE"
+        nonlocal paused
+        status = "PAUSED" if paused else "LIVE"
         try:
             with open("/tmp/ndw.status", "w") as f:
                 f.write(status)
@@ -138,28 +142,23 @@ def run_dictation(args):
         except Exception as e:
             safe_write(f"Error updating status file: {e}")
 
-    def toggle_pause(signum=None, frame=None):
-        state.paused = not state.paused
-        status = "PAUSED" if state.paused else "RESUMED"
-        timestamp = time.strftime("%H:%M:%S")
-        safe_write(f"\n--- {status} {timestamp} ---")
-        play_pip("pause" if state.paused else "resume")
-        update_status_file()
+    # Signal handlers - ONLY set flags, don't do complex work
+    def handle_sigusr1(signum, frame):
+        """Just signal that pause toggle was requested"""
+        pause_requested.set()
 
     def handle_sigint(signum, frame):
+        nonlocal exit_requested
         safe_write("\n--- EXITING... ---")
-        state.exit_requested = True
+        exit_requested = True
 
-    # SIGINT (Ctrl+C) is critical.
-    # Python's default behavior is to raise KeyboardInterrupt.
-    # By setting a handler, we override this, but we MUST make sure
-    # the main loop doesn't collapse.
     signal.signal(signal.SIGINT, handle_sigint)
-    signal.signal(signal.SIGUSR1, toggle_pause)
+    signal.signal(signal.SIGUSR1, handle_sigusr1)
 
     sys.stderr.write("--- ACTIVATING AUDIO ---\n")
     play_pip("resume")
     update_status_file()
+
     cmd = [
         "pw-cat",
         "--record",
@@ -183,7 +182,7 @@ def run_dictation(args):
     )
     sys.stderr.write("--- SYSTEM READY (ndw-pause to toggle) ---\n")
     sys.stderr.write(
-        "--- Controls: Ctrl+C = EXIT | 'p' ENTER = RESUME (if paused via ndw-pause) ---\n"
+        "--- Controls: Ctrl+C = EXIT | 'p' ENTER = RESUME (if paused) ---\n"
     )
 
     # Audio reader thread - reads from pipe continuously, even during transcription
@@ -191,35 +190,55 @@ def run_dictation(args):
     reader.start()
 
     audio_buffer = np.array([], dtype=np.float32)
-    # Rolling buffer of the last 500ms of silence
     silence_buffer = np.array([], dtype=np.float32)
     silence_limit_samples = int(args.sample_rate * 0.5)
 
     recording_started = False
     last_process_time = time.time()
 
-    # THE MAIN LOOP must be extremely resilient
-    while not state.exit_requested:
+    # THE MAIN LOOP
+    while not exit_requested:
         try:
             if reader.eof:
                 break
+
+            # Check for pause toggle request (from signal or stdin)
+            if pause_requested.is_set():
+                now = time.time()
+                # Debounce: ignore if too soon after last toggle
+                if now - last_toggle_time >= PAUSE_DEBOUNCE:
+                    with state_lock:
+                        paused = not paused
+                        last_toggle_time = now
+                        status = "PAUSED" if paused else "RESUMED"
+                        timestamp = time.strftime("%H:%M:%S")
+                        safe_write(f"\n--- {status} {timestamp} ---")
+                        play_pip("pause" if paused else "resume")
+                        update_status_file()
+                # Clear the flag regardless (debounce handles rapid clicks)
+                pause_requested.clear()
 
             # select ONLY on stdin for keyboard commands, 0.1s timeout
             r, _, _ = select.select([sys.stdin], [], [], 0.1)
 
             if sys.stdin in r:
                 line = sys.stdin.readline().lower()
-                if "p" in line and state.paused:
-                    state.paused = False
-                    sys.stderr.write("\n--- RESUMED ---\n")
-                    play_pip("resume")
-                    update_status_file()
-                elif "q" in line:
-                    state.exit_requested = True
+                with state_lock:
+                    if "p" in line and paused:
+                        paused = False
+                        safe_write("\n--- RESUMED ---")
+                        play_pip("resume")
+                        update_status_file()
+                    elif "q" in line:
+                        exit_requested = True
 
             now = time.time()
 
-            if state.paused:
+            # Check pause state with lock
+            with state_lock:
+                is_paused = paused
+
+            if is_paused:
                 reader.take_audio()  # discard audio during pause
                 audio_buffer = np.array([], dtype=np.float32)
                 silence_buffer = np.array([], dtype=np.float32)
@@ -282,11 +301,9 @@ def run_dictation(args):
                 sys.stderr.flush()
 
         except (KeyboardInterrupt, InterruptedError):
-            # The signal handler has already run and updated state.
-            # We just need to keep the loop going.
             continue
         except Exception as e:
-            if not state.exit_requested:
+            if not exit_requested:
                 sys.stderr.write(f"\nCRITICAL ERROR: {e}\n")
                 break
 
